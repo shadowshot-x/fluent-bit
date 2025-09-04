@@ -4149,14 +4149,6 @@ static struct flb_config_map config_map[] = {
     },
 
     {
-     FLB_CONFIG_MAP_INT, "retry_limit", "5",
-     0, FLB_TRUE, offsetof(struct flb_s3, retry_limit),
-     "Maximum number of retry attempts for failed uploads/chunks. "
-     "If we see repeated errors on an upload/chunk, we will discard it "
-     "after this many attempts to prevent infinite retry loops."
-    },
-
-    {
      FLB_CONFIG_MAP_TIME, "upload_parts_timeout", "10M",
      0, FLB_TRUE, offsetof(struct flb_s3, upload_parts_timeout),
      "Timeout to upload parts of a blob file"

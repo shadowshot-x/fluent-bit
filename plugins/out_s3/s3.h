@@ -132,7 +132,6 @@ struct flb_s3 {
     time_t upload_parts_freshness_threshold;
     int file_delivery_attempt_limit;
     int part_delivery_attempt_limit;
-    int retry_limit;
     flb_sds_t authorization_endpoint_url;
     flb_sds_t authorization_endpoint_username;
     flb_sds_t authorization_endpoint_password;
