@@ -22,6 +22,7 @@ on:
       - 'examples/**'
     branches:
       - master
+      - 4.1
       - 4.0
       - 3.2
       - 3.1
@@ -53,6 +54,7 @@ jobs:
           - "-DFLB_SIMD=On"
           - "-DFLB_SIMD=Off"
           - "-DFLB_ARROW=On"
+          - "-DFLB_COMPILER_STRICT_POINTER_TYPES=On"
         cmake_version:
           - "3.31.6"
         compiler:
@@ -71,9 +73,30 @@ jobs:
             compiler:
               cc: clang
               cxx: clang++
+          - flb_option: "-DFLB_COMPILER_STRICT_POINTER_TYPES=On"
+            compiler:
+              cc: clang
+              cxx: clang++
     permissions:
       contents: read
     steps:
+      - name: Free disk space
+        run: |
+          echo "::group::Disk usage before cleanup"
+          df -h
+          echo "::endgroup::"
+
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/lib/jvm || true
+
+          sudo apt-get clean || true
+
+          echo "::group::Disk usage after cleanup"
+          df -h
+          echo "::endgroup::"
+
       - name: Setup environment
         run: |
           sudo apt-get update

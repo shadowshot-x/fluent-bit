@@ -29,6 +29,7 @@
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_router.h>
 #include <fluent-bit/flb_sds.h>
+#include <fluent-bit/flb_conditionals.h>
 #include <fluent-bit/config_format/flb_cf.h>
 
 #include <cfl/cfl_array.h>
@@ -276,8 +277,22 @@ static void route_condition_destroy(struct flb_route_condition *condition)
         if (rule->value) {
             flb_sds_destroy(rule->value);
         }
+        if (rule->values) {
+            size_t idx;
+
+            for (idx = 0; idx < rule->values_count; idx++) {
+                if (rule->values[idx]) {
+                    flb_sds_destroy(rule->values[idx]);
+                }
+            }
+            flb_free(rule->values);
+        }
 
         flb_free(rule);
+    }
+
+    if (condition->compiled) {
+        flb_condition_destroy(condition->compiled);
     }
 
     flb_free(condition);
@@ -371,6 +386,10 @@ static void input_routes_destroy(struct flb_input_routes *input)
 
     if (input->input_name) {
         flb_sds_destroy(input->input_name);
+    }
+
+    if (input->plugin_name) {
+        flb_sds_destroy(input->plugin_name);
     }
 
     flb_free(input);
@@ -500,6 +519,64 @@ static int parse_processors(struct cfl_variant *variant,
     return 0;
 }
 
+static int parse_condition_rule_context(const char *value,
+                                        enum record_context_type *out_context)
+{
+    if (!out_context) {
+        return -1;
+    }
+
+    if (!value) {
+        *out_context = RECORD_CONTEXT_BODY;
+        return 0;
+    }
+
+    if (strcasecmp(value, "metadata") == 0 ||
+        strcasecmp(value, "record_metadata") == 0 ||
+        strcasecmp(value, "attributes") == 0) {
+        *out_context = RECORD_CONTEXT_METADATA;
+        return 0;
+    }
+
+    if (strcasecmp(value, "body") == 0 ||
+        strcasecmp(value, "record") == 0 ||
+        strcasecmp(value, "message") == 0 ||
+        strcasecmp(value, "record_body") == 0) {
+        *out_context = RECORD_CONTEXT_BODY;
+        return 0;
+    }
+
+    if (strcasecmp(value, "group_metadata") == 0) {
+        *out_context = RECORD_CONTEXT_GROUP_METADATA;
+        return 0;
+    }
+
+    if (strcasecmp(value, "group_attributes") == 0 ||
+        strcasecmp(value, "group_body") == 0) {
+        *out_context = RECORD_CONTEXT_GROUP_ATTRIBUTES;
+        return 0;
+    }
+
+    if (strcasecmp(value, "otel_resource_attributes") == 0) {
+        *out_context = RECORD_CONTEXT_OTEL_RESOURCE_ATTRIBUTES;
+        return 0;
+    }
+
+    if (strcasecmp(value, "otel_scope_attributes") == 0) {
+        *out_context = RECORD_CONTEXT_OTEL_SCOPE_ATTRIBUTES;
+        return 0;
+    }
+
+    if (strcasecmp(value, "otel_scope_name") == 0 ||
+        strcasecmp(value, "otel_scope_version") == 0 ||
+        strcasecmp(value, "otel_scope_metadata") == 0) {
+        *out_context = RECORD_CONTEXT_OTEL_SCOPE_METADATA;
+        return 0;
+    }
+
+    return -1;
+}
+
 static struct flb_route_condition_rule *parse_condition_rule(struct cfl_variant *variant)
 {
     struct flb_route_condition_rule *rule;
@@ -507,6 +584,7 @@ static struct flb_route_condition_rule *parse_condition_rule(struct cfl_variant 
     struct cfl_variant *field_var;
     struct cfl_variant *op_var;
     struct cfl_variant *value_var;
+    struct cfl_variant *context_var;
 
     if (!variant || variant->type != CFL_VARIANT_KVLIST) {
         return NULL;
@@ -530,6 +608,9 @@ static struct flb_route_condition_rule *parse_condition_rule(struct cfl_variant 
         return NULL;
     }
     cfl_list_init(&rule->_head);
+    rule->values = NULL;
+    rule->values_count = 0;
+    rule->context = RECORD_CONTEXT_BODY;
 
     rule->field = copy_from_cfl_sds(field_var->data.as_string);
     if (!rule->field) {
@@ -544,9 +625,82 @@ static struct flb_route_condition_rule *parse_condition_rule(struct cfl_variant 
         return NULL;
     }
 
-    if (value_var) {
+    if (!value_var) {
+        flb_sds_destroy(rule->op);
+        flb_sds_destroy(rule->field);
+        flb_free(rule);
+        return NULL;
+    }
+
+    if (value_var->type == CFL_VARIANT_ARRAY) {
+        struct cfl_array *array;
+        struct cfl_variant *entry;
+        size_t idx;
+
+        array = value_var->data.as_array;
+        if (!array || cfl_array_size(array) == 0) {
+            flb_sds_destroy(rule->op);
+            flb_sds_destroy(rule->field);
+            flb_free(rule);
+            return NULL;
+        }
+
+        rule->values = flb_calloc(cfl_array_size(array), sizeof(flb_sds_t));
+        if (!rule->values) {
+            flb_errno();
+            flb_sds_destroy(rule->op);
+            flb_sds_destroy(rule->field);
+            flb_free(rule);
+            return NULL;
+        }
+
+        for (idx = 0; idx < cfl_array_size(array); idx++) {
+            entry = cfl_array_fetch_by_index(array, idx);
+            rule->values[idx] = variant_to_sds(entry);
+            if (!rule->values[idx]) {
+                size_t j;
+
+                for (j = 0; j < idx; j++) {
+                    flb_sds_destroy(rule->values[j]);
+                }
+                flb_free(rule->values);
+                flb_sds_destroy(rule->op);
+                flb_sds_destroy(rule->field);
+                flb_free(rule);
+                return NULL;
+            }
+        }
+        rule->values_count = cfl_array_size(array);
+    }
+    else {
         rule->value = variant_to_sds(value_var);
-        if (!rule->value && strcmp(rule->op, "exists") != 0) {
+        if (!rule->value) {
+            flb_sds_destroy(rule->op);
+            flb_sds_destroy(rule->field);
+            flb_free(rule);
+            return NULL;
+        }
+    }
+
+    context_var = cfl_kvlist_fetch(kvlist, "context");
+    if (context_var) {
+        if (context_var->type != CFL_VARIANT_STRING ||
+            parse_condition_rule_context(context_var->data.as_string, &rule->context) != 0) {
+            size_t j;
+
+            if (rule->values) {
+                for (j = 0; j < rule->values_count; j++) {
+                    if (rule->values[j]) {
+                        flb_sds_destroy(rule->values[j]);
+                    }
+                }
+                flb_free(rule->values);
+            }
+
+            if (rule->value) {
+                flb_sds_destroy(rule->value);
+            }
+
             flb_sds_destroy(rule->op);
             flb_sds_destroy(rule->field);
             flb_free(rule);
@@ -563,6 +717,7 @@ static struct flb_route_condition *parse_condition(struct cfl_variant *variant,
     struct flb_route_condition *condition;
     struct cfl_variant *rules_var;
     struct cfl_variant *default_var;
+    struct cfl_variant *op_var;
     struct cfl_array *rules_array;
     struct cfl_variant *entry;
     struct flb_route_condition_rule *rule;
@@ -579,9 +734,31 @@ static struct flb_route_condition *parse_condition(struct cfl_variant *variant,
         return NULL;
     }
     cfl_list_init(&condition->rules);
+    condition->op = FLB_COND_OP_AND;
+    condition->compiled = NULL;
+    condition->compiled_status = 0;
 
     rules_var = cfl_kvlist_fetch(variant->data.as_kvlist, "rules");
     default_var = cfl_kvlist_fetch(variant->data.as_kvlist, "default");
+    op_var = cfl_kvlist_fetch(variant->data.as_kvlist, "op");
+
+    if (op_var) {
+        if (op_var->type != CFL_VARIANT_STRING) {
+            route_condition_destroy(condition);
+            return NULL;
+        }
+
+        if (strcasecmp(op_var->data.as_string, "and") == 0) {
+            condition->op = FLB_COND_OP_AND;
+        }
+        else if (strcasecmp(op_var->data.as_string, "or") == 0) {
+            condition->op = FLB_COND_OP_OR;
+        }
+        else {
+            route_condition_destroy(condition);
+            return NULL;
+        }
+    }
 
     if (default_var) {
         if (variant_to_bool(default_var, &val) != 0) {
@@ -780,6 +957,7 @@ static int parse_route(struct cfl_variant *variant,
     cfl_list_init(&route->outputs);
     cfl_list_init(&route->processors);
     route->signals = signals;
+    route->per_record_routing = FLB_FALSE;  // Default to false
 
     route->name = copy_from_cfl_sds(name_var->data.as_string);
     if (!route->name) {
@@ -801,6 +979,15 @@ static int parse_route(struct cfl_variant *variant,
             flb_sds_destroy(route->name);
             flb_free(route);
             return -1;
+        }
+    }
+
+    // Parse per_record_routing option
+    struct cfl_variant *per_record_var = cfl_kvlist_fetch(kvlist, "per_record_routing");
+    if (per_record_var) {
+        int val;
+        if (variant_to_bool(per_record_var, &val) == 0) {
+            route->per_record_routing = val;
         }
     }
 
@@ -897,6 +1084,8 @@ static int parse_input_section(struct flb_cf_section *section,
                                struct cfl_list *input_routes,
                                struct flb_config *config)
 {
+    uint32_t mask;
+    size_t before_count;
     struct flb_input_routes *input;
     struct cfl_kvlist *kvlist;
     struct cfl_variant *name_var;
@@ -905,8 +1094,7 @@ static int parse_input_section(struct flb_cf_section *section,
     struct cfl_kvlist *routes_kvlist;
     struct cfl_list *head;
     struct cfl_kvpair *pair;
-    uint32_t mask;
-    size_t before_count;
+    struct cfl_variant *alias_var;
 
     if (!section || !input_routes) {
         return -1;
@@ -947,10 +1135,26 @@ static int parse_input_section(struct flb_cf_section *section,
     cfl_list_init(&input->_head);
     cfl_list_init(&input->processors);
     cfl_list_init(&input->routes);
+    input->has_alias = FLB_FALSE;
+    input->instance = NULL;
 
-    input->input_name = copy_from_cfl_sds(name_var->data.as_string);
-    if (!input->input_name) {
+    input->plugin_name = copy_from_cfl_sds(name_var->data.as_string);
+    if (!input->plugin_name) {
         flb_free(input);
+        return -1;
+    }
+
+    alias_var = cfl_kvlist_fetch(kvlist, "alias");
+    if (alias_var && alias_var->type == CFL_VARIANT_STRING &&
+        cfl_sds_len(alias_var->data.as_string) > 0) {
+        input->input_name = copy_from_cfl_sds(alias_var->data.as_string);
+        input->has_alias = FLB_TRUE;
+    }
+    else {
+        input->input_name = copy_from_cfl_sds(name_var->data.as_string);
+    }
+    if (!input->input_name) {
+        input_routes_destroy(input);
         return -1;
     }
 
@@ -1040,33 +1244,110 @@ int flb_router_config_parse(struct flb_cf *cf,
 }
 
 /* Apply parsed router configuration to actual input/output instances */
-static struct flb_input_instance *find_input_instance(struct flb_config *config,
-                                                     flb_sds_t name)
+static int input_instance_already_selected(struct flb_config *config,
+                                           struct flb_input_routes *current,
+                                           struct flb_input_instance *candidate)
 {
-    struct mk_list *head;
-    struct flb_input_instance *ins;
+    struct cfl_list *head;
+    struct flb_input_routes *routes;
 
-    if (!config || !name) {
-        return NULL;
+    if (!config || !candidate) {
+        return FLB_FALSE;
     }
 
-    mk_list_foreach(head, &config->inputs) {
-        ins = mk_list_entry(head, struct flb_input_instance, _head);
+    cfl_list_foreach(head, &config->input_routes) {
+        routes = cfl_list_entry(head, struct flb_input_routes, _head);
 
-        if (!ins->p) {
+        if (routes == current) {
             continue;
         }
 
-        if (ins->alias && strcmp(ins->alias, name) == 0) {
-            return ins;
+        if (routes->instance == candidate) {
+            return FLB_TRUE;
         }
+    }
 
-        if (strcmp(ins->name, name) == 0) {
-            return ins;
+    return FLB_FALSE;
+}
+
+static struct flb_input_instance *find_input_instance(struct flb_config *config,
+                                                     struct flb_input_routes *routes)
+{
+    struct mk_list *head;
+    struct flb_input_instance *ins;
+    size_t key_len;
+
+    if (!config || !routes) {
+        return NULL;
+    }
+
+    if (routes->instance) {
+        return routes->instance;
+    }
+
+    if (routes->has_alias && routes->input_name) {
+        mk_list_foreach(head, &config->inputs) {
+            ins = mk_list_entry(head, struct flb_input_instance, _head);
+
+            if (!ins->p || !ins->alias) {
+                continue;
+            }
+
+            if (strcmp(ins->alias, routes->input_name) == 0 &&
+                input_instance_already_selected(config, routes, ins) == FLB_FALSE) {
+                routes->instance = ins;
+                return ins;
+            }
         }
+    }
 
-        if (ins->p->name && strcmp(ins->p->name, name) == 0) {
-            return ins;
+    if (routes->input_name) {
+        mk_list_foreach(head, &config->inputs) {
+            ins = mk_list_entry(head, struct flb_input_instance, _head);
+
+            if (!ins->p) {
+                continue;
+            }
+
+            if (strcmp(ins->name, routes->input_name) == 0 &&
+                input_instance_already_selected(config, routes, ins) == FLB_FALSE) {
+                routes->instance = ins;
+                return ins;
+            }
+        }
+    }
+
+    if (routes->plugin_name) {
+        mk_list_foreach(head, &config->inputs) {
+            ins = mk_list_entry(head, struct flb_input_instance, _head);
+
+            if (!ins->p || !ins->p->name) {
+                continue;
+            }
+
+            if (strcmp(ins->p->name, routes->plugin_name) == 0 &&
+                input_instance_already_selected(config, routes, ins) == FLB_FALSE) {
+                routes->instance = ins;
+                return ins;
+            }
+        }
+    }
+
+    if (routes->input_name) {
+        key_len = flb_sds_len(routes->input_name);
+
+        mk_list_foreach(head, &config->inputs) {
+            ins = mk_list_entry(head, struct flb_input_instance, _head);
+
+            if (!ins->p || key_len == 0) {
+                continue;
+            }
+
+            if (strncmp(ins->name, routes->input_name, key_len) == 0 &&
+                input_instance_already_selected(config, routes, ins) == FLB_FALSE) {
+                routes->instance = ins;
+                return ins;
+            }
         }
     }
 
@@ -1109,15 +1390,15 @@ static struct flb_output_instance *find_output_instance(struct flb_config *confi
 static int input_has_direct_route(struct flb_input_instance *in,
                                   struct flb_output_instance *out)
 {
-    struct mk_list *head;
+    struct cfl_list *head;
     struct flb_router_path *path;
 
     if (!in || !out) {
         return FLB_FALSE;
     }
 
-    mk_list_foreach(head, &in->routes_direct) {
-        path = mk_list_entry(head, struct flb_router_path, _head);
+    cfl_list_foreach(head, &in->routes_direct) {
+        path = cfl_list_entry(head, struct flb_router_path, _head);
         if (path->ins == out) {
             return FLB_TRUE;
         }
@@ -1153,6 +1434,7 @@ static int output_supports_signals(struct flb_output_instance *out, uint32_t sig
 
 int flb_router_apply_config(struct flb_config *config)
 {
+    int created = 0;
     struct cfl_list *input_head;
     struct cfl_list *route_head;
     struct cfl_list *output_head;
@@ -1162,19 +1444,16 @@ int flb_router_apply_config(struct flb_config *config)
     struct flb_input_instance *input_ins;
     struct flb_output_instance *output_ins;
     struct flb_output_instance *fallback_ins;
-    int created;
+    struct flb_router_path *path;
 
     if (!config) {
         return 0;
     }
 
-    flb_debug("[router] applying router configuration");
-    created = 0;
-
     cfl_list_foreach(input_head, &config->input_routes) {
         input_routes = cfl_list_entry(input_head, struct flb_input_routes, _head);
 
-        input_ins = find_input_instance(config, input_routes->input_name);
+        input_ins = find_input_instance(config, input_routes);
         if (!input_ins) {
             flb_warn("[router] could not find input instance '%s' for routes",
                      input_routes->input_name ? input_routes->input_name : "(null)");
@@ -1215,11 +1494,15 @@ int flb_router_apply_config(struct flb_config *config)
                     continue;
                 }
 
+                route_output->ins = output_ins;
+
                 if (input_has_direct_route(input_ins, output_ins)) {
                     continue;
                 }
 
                 if (flb_router_connect_direct(input_ins, output_ins) == 0) {
+                    path = cfl_list_entry_last(&input_ins->routes_direct, struct flb_router_path, _head);
+                    path->route = route;
                     created++;
                     flb_debug("[router] connected input '%s' route '%s' to output '%s'",
                               flb_input_name(input_ins),

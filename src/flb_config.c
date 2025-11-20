@@ -164,6 +164,13 @@ struct flb_service_config service_configs[] = {
     {FLB_CONF_STORAGE_INHERIT,
      FLB_CONF_TYPE_BOOL,
      offsetof(struct flb_config, storage_inherit)},
+    /* Storage / DLQ */
+    {FLB_CONF_STORAGE_KEEP_REJECTED,
+     FLB_CONF_TYPE_BOOL,
+     offsetof(struct flb_config, storage_keep_rejected)},
+    {FLB_CONF_STORAGE_REJECTED_PATH,
+     FLB_CONF_TYPE_STR,
+     offsetof(struct flb_config, storage_rejected_path)},
 
     /* Coroutines */
     {FLB_CONF_STR_CORO_STACK_SIZE,
@@ -304,7 +311,45 @@ struct flb_config *flb_config_init()
     }
 
     /* Routing */
-    flb_routes_mask_set_size(1, config);
+    config->router = flb_router_create(config);
+    if (!config->router) {
+        flb_error("[config] could not create router");
+        if (config->kernel) {
+            flb_kernel_destroy(config->kernel);
+        }
+#ifdef FLB_HAVE_HTTP_SERVER
+        if (config->http_listen) {
+            flb_free(config->http_listen);
+        }
+
+        if (config->http_port) {
+            flb_free(config->http_port);
+        }
+#endif
+        flb_cf_destroy(cf);
+        flb_free(config);
+        return NULL;
+    }
+    ret = flb_routes_mask_set_size(1, config->router);
+    if (ret != 0) {
+        flb_error("[config] routing mask dimensioning failed");
+        flb_router_destroy(config->router);
+        if (config->kernel) {
+            flb_kernel_destroy(config->kernel);
+        }
+#ifdef FLB_HAVE_HTTP_SERVER
+        if (config->http_listen) {
+            flb_free(config->http_listen);
+        }
+
+        if (config->http_port) {
+            flb_free(config->http_port);
+        }
+#endif
+        flb_cf_destroy(cf);
+        flb_free(config);
+        return NULL;
+    }
 
     config->cio          = NULL;
     config->storage_path = NULL;
@@ -313,6 +358,7 @@ struct flb_config *flb_config_init()
     config->storage_type = NULL;
     config->storage_inherit = FLB_FALSE;
     config->storage_bl_flush_on_shutdown = FLB_FALSE;
+    config->storage_rejected_path = NULL;
     config->sched_cap  = FLB_SCHED_CAP;
     config->sched_base = FLB_SCHED_BASE;
     config->json_escape_unicode = FLB_TRUE;
@@ -575,6 +621,9 @@ void flb_config_exit(struct flb_config *config)
     if (config->storage_bl_mem_limit) {
         flb_free(config->storage_bl_mem_limit);
     }
+    if (config->storage_rejected_path) {
+        flb_free(config->storage_rejected_path);
+    }
 
 #ifdef FLB_HAVE_STREAM_PROCESSOR
     if (config->stream_processor_file) {
@@ -613,7 +662,8 @@ void flb_config_exit(struct flb_config *config)
 
     /* release task map */
     flb_config_task_map_resize(config, 0);
-    flb_routes_empty_mask_destroy(config);
+
+    flb_router_destroy(config->router);
 
     /* Clean up router input routes */
     flb_router_routes_destroy(&config->input_routes);

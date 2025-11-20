@@ -6,7 +6,11 @@
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_router.h>
 #include <fluent-bit/flb_sds.h>
+#include <fluent-bit/flb_log_event_encoder.h>
 #include <fluent-bit/flb_event.h>
+#include <fluent-bit/flb_mem.h>
+#include <fluent-bit/flb_mp.h>
+#include <fluent-bit/flb_opentelemetry.h>
 #include <fluent-bit/config_format/flb_cf.h>
 
 #include <cfl/cfl.h>
@@ -14,6 +18,7 @@
 #include <cfl/cfl_kvlist.h>
 #include <cfl/cfl_variant.h>
 #include <cfl/cfl_sds.h>
+#include <cfl/cfl_object.h>
 
 #include "flb_tests_internal.h"
 
@@ -26,6 +31,385 @@
 #endif
 
 static struct cfl_variant *clone_variant(struct cfl_variant *var);
+
+static int build_log_chunk(const char *level,
+                           struct flb_log_event_encoder *encoder,
+                           struct flb_event_chunk *chunk)
+{
+    int ret;
+
+    if (!level || !encoder || !chunk) {
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_init(encoder, FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_begin_record(encoder);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_set_current_timestamp(encoder);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_append_body_values(
+        encoder,
+        FLB_LOG_EVENT_STRING_VALUE("level", 5),
+        FLB_LOG_EVENT_CSTRING_VALUE(level));
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_commit_record(encoder);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    memset(chunk, 0, sizeof(*chunk));
+    chunk->type = FLB_EVENT_TYPE_LOGS;
+    chunk->data = encoder->output_buffer;
+    chunk->size = encoder->output_length;
+    chunk->total_events = 1;
+
+    return 0;
+}
+
+static int build_log_chunk_with_metadata(const char *metadata_key,
+                                         const char *metadata_value,
+                                         const char *body_key,
+                                         const char *body_value,
+                                         struct flb_log_event_encoder *encoder,
+                                         struct flb_event_chunk *chunk)
+{
+    int ret;
+
+    if (!encoder || !chunk) {
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_init(encoder, FLB_LOG_EVENT_FORMAT_DEFAULT);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_begin_record(encoder);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_set_current_timestamp(encoder);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    if (metadata_key && metadata_value) {
+        ret = flb_log_event_encoder_append_metadata_values(
+            encoder,
+            FLB_LOG_EVENT_STRING_VALUE(metadata_key, strlen(metadata_key)),
+            FLB_LOG_EVENT_CSTRING_VALUE(metadata_value));
+        if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+            flb_log_event_encoder_destroy(encoder);
+            return -1;
+        }
+    }
+
+    if (body_key && body_value) {
+        ret = flb_log_event_encoder_append_body_values(
+            encoder,
+            FLB_LOG_EVENT_STRING_VALUE(body_key, strlen(body_key)),
+            FLB_LOG_EVENT_CSTRING_VALUE(body_value));
+        if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+            flb_log_event_encoder_destroy(encoder);
+            return -1;
+        }
+    }
+
+    ret = flb_log_event_encoder_commit_record(encoder);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    memset(chunk, 0, sizeof(*chunk));
+    chunk->type = FLB_EVENT_TYPE_LOGS;
+    chunk->data = encoder->output_buffer;
+    chunk->size = encoder->output_length;
+    chunk->total_events = 1;
+
+    return 0;
+}
+
+static int build_log_group_chunk(const char *group_metadata_key,
+                                 const char *group_metadata_value,
+                                 const char *group_attribute_key,
+                                 const char *group_attribute_value,
+                                 const char *record_body_key,
+                                 const char *record_body_value,
+                                 struct flb_log_event_encoder *encoder,
+                                 struct flb_event_chunk *chunk)
+{
+    int ret;
+
+    if (!encoder || !chunk) {
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_init(encoder, FLB_LOG_EVENT_FORMAT_DEFAULT);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_group_init(encoder);
+    if (ret != 0) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_append_metadata_values(
+        encoder,
+        FLB_LOG_EVENT_STRING_VALUE(group_metadata_key, strlen(group_metadata_key)),
+        FLB_LOG_EVENT_CSTRING_VALUE(group_metadata_value));
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_append_body_values(
+        encoder,
+        FLB_LOG_EVENT_STRING_VALUE(group_attribute_key, strlen(group_attribute_key)),
+        FLB_LOG_EVENT_CSTRING_VALUE(group_attribute_value));
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_group_header_end(encoder);
+    if (ret != 0) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_begin_record(encoder);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_set_current_timestamp(encoder);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_append_body_values(
+        encoder,
+        FLB_LOG_EVENT_STRING_VALUE(record_body_key, strlen(record_body_key)),
+        FLB_LOG_EVENT_CSTRING_VALUE(record_body_value));
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_commit_record(encoder);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    ret = flb_log_event_encoder_group_end(encoder);
+    if (ret != 0) {
+        flb_log_event_encoder_destroy(encoder);
+        return -1;
+    }
+
+    memset(chunk, 0, sizeof(*chunk));
+    chunk->type = FLB_EVENT_TYPE_LOGS;
+    chunk->data = encoder->output_buffer;
+    chunk->size = encoder->output_length;
+    chunk->total_events = 1;
+
+    return 0;
+}
+
+static int build_log_chunk_with_otel(const char *service_name,
+                                     const char *scope_name,
+                                     const char *scope_version,
+                                     const char *scope_attribute_key,
+                                     const char *scope_attribute_value,
+                                     struct flb_log_event_encoder *encoder,
+                                     struct flb_event_chunk *chunk)
+{
+    char *otlp_json = NULL;
+    int ret;
+    int error_status = 0;
+    size_t json_len;
+    const char *attr_key = scope_attribute_key;
+
+    if (!encoder || !chunk) {
+        return -1;
+    }
+
+    /* Extract attribute key from "scope.attr" format if needed */
+    if (strncmp(scope_attribute_key, "scope.", 6) == 0) {
+        attr_key = scope_attribute_key + 6; /* Skip "scope." prefix */
+    }
+
+    /* Build OTLP JSON format with nested structure for service.name */
+    /* Note: We create a nested service object to match $service['name'] accessor */
+    json_len = snprintf(NULL, 0,
+        "{"
+        "\"resourceLogs\":["
+        "{"
+        "\"resource\":{"
+        "\"attributes\":["
+        "{\"key\":\"service\",\"value\":{\"kvlistValue\":{\"values\":[{\"key\":\"name\",\"value\":{\"stringValue\":\"%s\"}}]}}}"
+        "]"
+        "},"
+        "\"scopeLogs\":["
+        "{"
+        "\"scope\":{"
+        "\"name\":\"%s\","
+        "\"version\":\"%s\","
+        "\"attributes\":["
+        "{\"key\":\"scope\",\"value\":{\"kvlistValue\":{\"values\":[{\"key\":\"%s\",\"value\":{\"stringValue\":\"%s\"}}]}}}"
+        "]"
+        "},"
+        "\"logRecords\":["
+        "{"
+        "\"timeUnixNano\":\"1728172800000000000\","
+        "\"severityNumber\":9,"
+        "\"severityText\":\"INFO\","
+        "\"body\":{\"stringValue\":\"test log\"}"
+        "}"
+        "]"
+        "}"
+        "]"
+        "}"
+        "]"
+        "}",
+        service_name, scope_name, scope_version, attr_key, scope_attribute_value);
+
+    otlp_json = flb_malloc(json_len + 1);
+    if (!otlp_json) {
+        return -1;
+    }
+
+    snprintf(otlp_json, json_len + 1,
+        "{"
+        "\"resourceLogs\":["
+        "{"
+        "\"resource\":{"
+        "\"attributes\":["
+        "{\"key\":\"service\",\"value\":{\"kvlistValue\":{\"values\":[{\"key\":\"name\",\"value\":{\"stringValue\":\"%s\"}}]}}}"
+        "]"
+        "},"
+        "\"scopeLogs\":["
+        "{"
+        "\"scope\":{"
+        "\"name\":\"%s\","
+        "\"version\":\"%s\","
+        "\"attributes\":["
+        "{\"key\":\"scope\",\"value\":{\"kvlistValue\":{\"values\":[{\"key\":\"%s\",\"value\":{\"stringValue\":\"%s\"}}]}}}"
+        "]"
+        "},"
+        "\"logRecords\":["
+        "{"
+        "\"timeUnixNano\":\"1728172800000000000\","
+        "\"severityNumber\":9,"
+        "\"severityText\":\"INFO\","
+        "\"body\":{\"stringValue\":\"test log\"}"
+        "}"
+        "]"
+        "}"
+        "]"
+        "}"
+        "]"
+        "}",
+        service_name, scope_name, scope_version, attr_key, scope_attribute_value);
+
+    /* Initialize encoder buffer (needed for msgpack_sbuffer_write) */
+    memset(encoder, 0, sizeof(*encoder));
+    msgpack_sbuffer_init(&encoder->buffer);
+
+    /* Convert OTLP JSON to msgpack using the actual converter */
+    ret = flb_opentelemetry_logs_json_to_msgpack(encoder, otlp_json, json_len, NULL, &error_status);
+    flb_free(otlp_json);
+
+    if (ret != 0) {
+        msgpack_sbuffer_destroy(&encoder->buffer);
+        return -1;
+    }
+
+    /* Set up the chunk from the encoder output */
+    memset(chunk, 0, sizeof(*chunk));
+    chunk->type = FLB_EVENT_TYPE_LOGS;
+    chunk->data = encoder->output_buffer;
+    chunk->size = encoder->output_length;
+    /* Count actual events in the buffer */
+    chunk->total_events = flb_mp_count(encoder->output_buffer, encoder->output_length);
+
+    return 0;
+}
+
+static void free_route_condition(struct flb_route_condition *condition)
+{
+    struct cfl_list *tmp;
+    struct cfl_list *head;
+    struct flb_route_condition_rule *rule;
+    size_t idx;
+
+    if (!condition) {
+        return;
+    }
+
+    if (condition->compiled) {
+        flb_condition_destroy(condition->compiled);
+    }
+
+    cfl_list_foreach_safe(head, tmp, &condition->rules) {
+        rule = cfl_list_entry(head, struct flb_route_condition_rule, _head);
+        cfl_list_del(&rule->_head);
+
+        if (rule->field) {
+            flb_sds_destroy(rule->field);
+        }
+        if (rule->op) {
+            flb_sds_destroy(rule->op);
+        }
+        if (rule->value) {
+            flb_sds_destroy(rule->value);
+        }
+        if (rule->values) {
+            for (idx = 0; idx < rule->values_count; idx++) {
+                if (rule->values[idx]) {
+                    flb_sds_destroy(rule->values[idx]);
+                }
+            }
+            flb_free(rule->values);
+        }
+
+        flb_free(rule);
+    }
+
+    flb_free(condition);
+}
+
 
 static struct cfl_array *clone_array(struct cfl_array *array)
 {
@@ -656,6 +1040,58 @@ void test_router_config_parse_file_metrics()
     flb_cf_destroy(cf);
 }
 
+void test_router_config_parse_file_contexts()
+{
+    struct cfl_list routes;
+    struct flb_cf *cf;
+    struct flb_input_routes *input_routes;
+    struct flb_route *route;
+    struct flb_route_condition_rule *rule;
+    struct cfl_list *head;
+    enum record_context_type expected[3] = {
+        RECORD_CONTEXT_METADATA,
+        RECORD_CONTEXT_GROUP_ATTRIBUTES,
+        RECORD_CONTEXT_OTEL_RESOURCE_ATTRIBUTES
+    };
+    size_t idx;
+    int ret;
+
+    cf = load_cf_from_yaml(FLB_ROUTER_TEST_FILE("context.yaml"));
+    TEST_CHECK(cf != NULL);
+    if (!cf) {
+        return;
+    }
+
+    cfl_list_init(&routes);
+
+    ret = flb_router_config_parse(cf, &routes, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret != 0) {
+        flb_cf_destroy(cf);
+        return;
+    }
+
+    input_routes = cfl_list_entry(routes.next, struct flb_input_routes, _head);
+    TEST_CHECK(strcmp(input_routes->input_name, "dummy") == 0);
+
+    route = cfl_list_entry(input_routes->routes.next, struct flb_route, _head);
+    TEST_CHECK(route->condition != NULL);
+
+    idx = 0;
+    cfl_list_foreach(head, &route->condition->rules) {
+        rule = cfl_list_entry(head, struct flb_route_condition_rule, _head);
+        TEST_CHECK(idx < sizeof(expected) / sizeof(expected[0]));
+        if (idx < sizeof(expected) / sizeof(expected[0])) {
+            TEST_CHECK(rule->context == expected[idx]);
+        }
+        idx++;
+    }
+    TEST_CHECK(idx == sizeof(expected) / sizeof(expected[0]));
+
+    flb_router_routes_destroy(&routes);
+    flb_cf_destroy(cf);
+}
+
 static void setup_test_instances(struct flb_config *config,
                                  struct flb_input_instance *input,
                                  struct flb_input_plugin *input_plugin,
@@ -673,8 +1109,8 @@ static void setup_test_instances(struct flb_config *config,
 
     memset(input, 0, sizeof(struct flb_input_instance));
     mk_list_init(&input->_head);
-    mk_list_init(&input->routes_direct);
-    mk_list_init(&input->routes);
+    cfl_list_init(&input->routes_direct);
+    cfl_list_init(&input->routes);
     mk_list_init(&input->tasks);
     mk_list_init(&input->chunks);
     mk_list_init(&input->collectors);
@@ -727,6 +1163,8 @@ void test_router_apply_config_success()
     cfl_list_init(&input_routes._head);
     cfl_list_init(&input_routes.routes);
     input_routes.input_name = flb_sds_create("dummy");
+    input_routes.plugin_name = flb_sds_create("dummy");
+    input_routes.has_alias = FLB_FALSE;
     cfl_list_add(&input_routes._head, &config.input_routes);
 
     memset(&route, 0, sizeof(route));
@@ -742,9 +1180,9 @@ void test_router_apply_config_success()
     cfl_list_add(&route_output._head, &route.outputs);
 
     TEST_CHECK(flb_router_apply_config(&config) == 0);
-    TEST_CHECK(mk_list_size(&input.routes_direct) == 1);
+    TEST_CHECK(cfl_list_size(&input.routes_direct) == 1);
 
-    path = mk_list_entry(input.routes_direct.next, struct flb_router_path, _head);
+    path = cfl_list_entry(input.routes_direct.next, struct flb_router_path, _head);
     TEST_CHECK(path->ins == &output);
 
     flb_router_exit(&config);
@@ -752,6 +1190,7 @@ void test_router_apply_config_success()
     flb_sds_destroy(input.alias);
     flb_sds_destroy(output.alias);
     flb_sds_destroy(input_routes.input_name);
+    flb_sds_destroy(input_routes.plugin_name);
     flb_sds_destroy(route.name);
     flb_sds_destroy(route_output.name);
 }
@@ -774,6 +1213,8 @@ void test_router_apply_config_missing_output()
     cfl_list_init(&input_routes._head);
     cfl_list_init(&input_routes.routes);
     input_routes.input_name = flb_sds_create("dummy");
+    input_routes.plugin_name = flb_sds_create("dummy");
+    input_routes.has_alias = FLB_FALSE;
     cfl_list_add(&input_routes._head, &config.input_routes);
 
     memset(&route, 0, sizeof(route));
@@ -790,16 +1231,302 @@ void test_router_apply_config_missing_output()
 
     TEST_CHECK(flb_router_apply_config(&config) == 0);
 
-    /* note mk_list_is_empty return 0 if is empty */
-    TEST_CHECK(!mk_list_is_empty(&input.routes_direct));
+    /* When output is missing, no routes should be created */
+    TEST_CHECK(cfl_list_is_empty(&input.routes_direct));
 
     flb_router_exit(&config);
 
     flb_sds_destroy(input.alias);
     flb_sds_destroy(output.alias);
     flb_sds_destroy(input_routes.input_name);
+    flb_sds_destroy(input_routes.plugin_name);
     flb_sds_destroy(route.name);
     flb_sds_destroy(route_output.name);
+}
+
+void test_router_apply_config_uses_input_alias()
+{
+    struct flb_config config;
+    struct flb_input_instance input_one;
+    struct flb_input_instance input_two;
+    struct flb_output_instance output_one;
+    struct flb_output_instance output_two;
+    struct flb_input_routes routes_one;
+    struct flb_input_routes routes_two;
+    struct flb_route route_one;
+    struct flb_route route_two;
+    struct flb_route_output route_output_one;
+    struct flb_route_output route_output_two;
+    struct flb_input_plugin input_plugin;
+    struct flb_output_plugin output_plugin_one;
+    struct flb_output_plugin output_plugin_two;
+    struct flb_router_path *path;
+
+    memset(&config, 0, sizeof(config));
+    mk_list_init(&config.inputs);
+    mk_list_init(&config.outputs);
+    cfl_list_init(&config.input_routes);
+
+    memset(&input_one, 0, sizeof(input_one));
+    mk_list_init(&input_one._head);
+    cfl_list_init(&input_one.routes_direct);
+    cfl_list_init(&input_one.routes);
+    mk_list_init(&input_one.tasks);
+    mk_list_init(&input_one.chunks);
+    mk_list_init(&input_one.collectors);
+    snprintf(input_one.name, sizeof(input_one.name), "dummy.0");
+    input_one.alias = flb_sds_create("input_one");
+    input_one.p = &input_plugin;
+    input_one.config = &config;
+    mk_list_add(&input_one._head, &config.inputs);
+
+    memset(&input_two, 0, sizeof(input_two));
+    mk_list_init(&input_two._head);
+    cfl_list_init(&input_two.routes_direct);
+    cfl_list_init(&input_two.routes);
+    mk_list_init(&input_two.tasks);
+    mk_list_init(&input_two.chunks);
+    mk_list_init(&input_two.collectors);
+    snprintf(input_two.name, sizeof(input_two.name), "dummy.1");
+    input_two.alias = flb_sds_create("input_two");
+    input_two.p = &input_plugin;
+    input_two.config = &config;
+    mk_list_add(&input_two._head, &config.inputs);
+
+    memset(&input_plugin, 0, sizeof(input_plugin));
+    input_plugin.name = "dummy";
+
+    memset(&output_one, 0, sizeof(output_one));
+    mk_list_init(&output_one._head);
+    mk_list_init(&output_one.properties);
+    mk_list_init(&output_one.net_properties);
+    snprintf(output_one.name, sizeof(output_one.name), "stdout.0");
+    output_one.alias = flb_sds_create("print_one");
+    output_one.event_type = FLB_OUTPUT_LOGS;
+    output_one.p = &output_plugin_one;
+    mk_list_add(&output_one._head, &config.outputs);
+
+    memset(&output_two, 0, sizeof(output_two));
+    mk_list_init(&output_two._head);
+    mk_list_init(&output_two.properties);
+    mk_list_init(&output_two.net_properties);
+    snprintf(output_two.name, sizeof(output_two.name), "stdout.1");
+    output_two.alias = flb_sds_create("print_two");
+    output_two.event_type = FLB_OUTPUT_LOGS;
+    output_two.p = &output_plugin_two;
+    mk_list_add(&output_two._head, &config.outputs);
+
+    memset(&output_plugin_one, 0, sizeof(output_plugin_one));
+    output_plugin_one.name = "stdout";
+    memset(&output_plugin_two, 0, sizeof(output_plugin_two));
+    output_plugin_two.name = "stdout";
+
+    memset(&routes_one, 0, sizeof(routes_one));
+    cfl_list_init(&routes_one._head);
+    cfl_list_init(&routes_one.routes);
+    routes_one.input_name = flb_sds_create("input_one");
+    routes_one.plugin_name = flb_sds_create("dummy");
+    routes_one.has_alias = FLB_TRUE;
+    cfl_list_add(&routes_one._head, &config.input_routes);
+
+    memset(&route_one, 0, sizeof(route_one));
+    cfl_list_init(&route_one._head);
+    cfl_list_init(&route_one.outputs);
+    route_one.name = flb_sds_create("route_one");
+    route_one.signals = FLB_ROUTER_SIGNAL_LOGS;
+    cfl_list_add(&route_one._head, &routes_one.routes);
+
+    memset(&route_output_one, 0, sizeof(route_output_one));
+    cfl_list_init(&route_output_one._head);
+    route_output_one.name = flb_sds_create("print_one");
+    cfl_list_add(&route_output_one._head, &route_one.outputs);
+
+    memset(&routes_two, 0, sizeof(routes_two));
+    cfl_list_init(&routes_two._head);
+    cfl_list_init(&routes_two.routes);
+    routes_two.input_name = flb_sds_create("input_two");
+    routes_two.plugin_name = flb_sds_create("dummy");
+    routes_two.has_alias = FLB_TRUE;
+    cfl_list_add(&routes_two._head, &config.input_routes);
+
+    memset(&route_two, 0, sizeof(route_two));
+    cfl_list_init(&route_two._head);
+    cfl_list_init(&route_two.outputs);
+    route_two.name = flb_sds_create("route_two");
+    route_two.signals = FLB_ROUTER_SIGNAL_LOGS;
+    cfl_list_add(&route_two._head, &routes_two.routes);
+
+    memset(&route_output_two, 0, sizeof(route_output_two));
+    cfl_list_init(&route_output_two._head);
+    route_output_two.name = flb_sds_create("print_two");
+    cfl_list_add(&route_output_two._head, &route_two.outputs);
+
+    TEST_CHECK(flb_router_apply_config(&config) == 0);
+
+    TEST_CHECK(cfl_list_size(&input_one.routes_direct) == 1);
+    path = cfl_list_entry(input_one.routes_direct.next, struct flb_router_path, _head);
+    TEST_CHECK(path->ins == &output_one);
+
+    TEST_CHECK(cfl_list_size(&input_two.routes_direct) == 1);
+    path = cfl_list_entry(input_two.routes_direct.next, struct flb_router_path, _head);
+    TEST_CHECK(path->ins == &output_two);
+
+    flb_router_exit(&config);
+
+    flb_sds_destroy(input_one.alias);
+    flb_sds_destroy(input_two.alias);
+    flb_sds_destroy(output_one.alias);
+    flb_sds_destroy(output_two.alias);
+    flb_sds_destroy(routes_one.input_name);
+    flb_sds_destroy(routes_one.plugin_name);
+    flb_sds_destroy(routes_two.input_name);
+    flb_sds_destroy(routes_two.plugin_name);
+    flb_sds_destroy(route_one.name);
+    flb_sds_destroy(route_two.name);
+    flb_sds_destroy(route_output_one.name);
+    flb_sds_destroy(route_output_two.name);
+}
+
+void test_router_apply_config_distinct_instances_without_alias()
+{
+    struct flb_config config;
+    struct flb_input_instance input_one;
+    struct flb_input_instance input_two;
+    struct flb_output_instance output_one;
+    struct flb_output_instance output_two;
+    struct flb_input_routes routes_one;
+    struct flb_input_routes routes_two;
+    struct flb_route route_one;
+    struct flb_route route_two;
+    struct flb_route_output route_output_one;
+    struct flb_route_output route_output_two;
+    struct flb_input_plugin input_plugin;
+    struct flb_output_plugin output_plugin_one;
+    struct flb_output_plugin output_plugin_two;
+    struct flb_router_path *path;
+
+    memset(&config, 0, sizeof(config));
+    mk_list_init(&config.inputs);
+    mk_list_init(&config.outputs);
+    cfl_list_init(&config.input_routes);
+
+    memset(&input_one, 0, sizeof(input_one));
+    mk_list_init(&input_one._head);
+    cfl_list_init(&input_one.routes_direct);
+    cfl_list_init(&input_one.routes);
+    mk_list_init(&input_one.tasks);
+    mk_list_init(&input_one.chunks);
+    mk_list_init(&input_one.collectors);
+    snprintf(input_one.name, sizeof(input_one.name), "dummy.0");
+    input_one.p = &input_plugin;
+    input_one.config = &config;
+    mk_list_add(&input_one._head, &config.inputs);
+
+    memset(&input_two, 0, sizeof(input_two));
+    mk_list_init(&input_two._head);
+    cfl_list_init(&input_two.routes_direct);
+    cfl_list_init(&input_two.routes);
+    mk_list_init(&input_two.tasks);
+    mk_list_init(&input_two.chunks);
+    mk_list_init(&input_two.collectors);
+    snprintf(input_two.name, sizeof(input_two.name), "dummy.1");
+    input_two.p = &input_plugin;
+    input_two.config = &config;
+    mk_list_add(&input_two._head, &config.inputs);
+
+    memset(&input_plugin, 0, sizeof(input_plugin));
+    input_plugin.name = "dummy";
+
+    memset(&output_one, 0, sizeof(output_one));
+    mk_list_init(&output_one._head);
+    mk_list_init(&output_one.properties);
+    mk_list_init(&output_one.net_properties);
+    snprintf(output_one.name, sizeof(output_one.name), "stdout.0");
+    output_one.alias = flb_sds_create("print_one");
+    output_one.event_type = FLB_OUTPUT_LOGS;
+    output_one.p = &output_plugin_one;
+    mk_list_add(&output_one._head, &config.outputs);
+
+    memset(&output_two, 0, sizeof(output_two));
+    mk_list_init(&output_two._head);
+    mk_list_init(&output_two.properties);
+    mk_list_init(&output_two.net_properties);
+    snprintf(output_two.name, sizeof(output_two.name), "stdout.1");
+    output_two.alias = flb_sds_create("print_two");
+    output_two.event_type = FLB_OUTPUT_LOGS;
+    output_two.p = &output_plugin_two;
+    mk_list_add(&output_two._head, &config.outputs);
+
+    memset(&output_plugin_one, 0, sizeof(output_plugin_one));
+    output_plugin_one.name = "stdout";
+    memset(&output_plugin_two, 0, sizeof(output_plugin_two));
+    output_plugin_two.name = "stdout";
+
+    memset(&routes_one, 0, sizeof(routes_one));
+    cfl_list_init(&routes_one._head);
+    cfl_list_init(&routes_one.routes);
+    routes_one.input_name = flb_sds_create("dummy");
+    routes_one.plugin_name = flb_sds_create("dummy");
+    routes_one.has_alias = FLB_FALSE;
+    cfl_list_add(&routes_one._head, &config.input_routes);
+
+    memset(&route_one, 0, sizeof(route_one));
+    cfl_list_init(&route_one._head);
+    cfl_list_init(&route_one.outputs);
+    route_one.name = flb_sds_create("route_one");
+    route_one.signals = FLB_ROUTER_SIGNAL_LOGS;
+    cfl_list_add(&route_one._head, &routes_one.routes);
+
+    memset(&route_output_one, 0, sizeof(route_output_one));
+    cfl_list_init(&route_output_one._head);
+    route_output_one.name = flb_sds_create("print_one");
+    cfl_list_add(&route_output_one._head, &route_one.outputs);
+
+    memset(&routes_two, 0, sizeof(routes_two));
+    cfl_list_init(&routes_two._head);
+    cfl_list_init(&routes_two.routes);
+    routes_two.input_name = flb_sds_create("dummy");
+    routes_two.plugin_name = flb_sds_create("dummy");
+    routes_two.has_alias = FLB_FALSE;
+    cfl_list_add(&routes_two._head, &config.input_routes);
+
+    memset(&route_two, 0, sizeof(route_two));
+    cfl_list_init(&route_two._head);
+    cfl_list_init(&route_two.outputs);
+    route_two.name = flb_sds_create("route_two");
+    route_two.signals = FLB_ROUTER_SIGNAL_LOGS;
+    cfl_list_add(&route_two._head, &routes_two.routes);
+
+    memset(&route_output_two, 0, sizeof(route_output_two));
+    cfl_list_init(&route_output_two._head);
+    route_output_two.name = flb_sds_create("print_two");
+    cfl_list_add(&route_output_two._head, &route_two.outputs);
+
+    TEST_CHECK(flb_router_apply_config(&config) == 0);
+
+    TEST_CHECK(cfl_list_size(&input_one.routes_direct) == 1);
+    path = cfl_list_entry(input_one.routes_direct.next, struct flb_router_path, _head);
+    TEST_CHECK(path->ins == &output_one);
+
+    TEST_CHECK(cfl_list_size(&input_two.routes_direct) == 1);
+    path = cfl_list_entry(input_two.routes_direct.next, struct flb_router_path, _head);
+    TEST_CHECK(path->ins == &output_two);
+
+    TEST_CHECK(routes_one.instance == &input_one);
+    TEST_CHECK(routes_two.instance == &input_two);
+
+    flb_router_exit(&config);
+
+    flb_sds_destroy(output_one.alias);
+    flb_sds_destroy(output_two.alias);
+    flb_sds_destroy(routes_one.input_name);
+    flb_sds_destroy(routes_one.plugin_name);
+    flb_sds_destroy(routes_two.input_name);
+    flb_sds_destroy(routes_two.plugin_name);
+    flb_sds_destroy(route_one.name);
+    flb_sds_destroy(route_two.name);
+    flb_sds_destroy(route_output_one.name);
+    flb_sds_destroy(route_output_two.name);
 }
 
 void test_router_route_default_precedence()
@@ -838,7 +1565,7 @@ void test_router_route_default_precedence()
     memset(&chunk, 0, sizeof(chunk));
     chunk.type = FLB_EVENT_TYPE_LOGS;
 
-    TEST_CHECK(flb_route_condition_eval(&chunk, route) == FLB_TRUE);
+    TEST_CHECK(flb_route_condition_eval(&chunk, NULL, route) == FLB_TRUE);
 
     output = cfl_list_entry(route->outputs.next, struct flb_route_output, _head);
     TEST_CHECK(strcmp(output->name, "lib_route") == 0);
@@ -850,14 +1577,776 @@ void test_router_route_default_precedence()
     flb_cf_destroy(cf);
 }
 
+static void test_router_condition_eval_logs_metadata_context()
+{
+    struct flb_route route;
+    struct flb_route_condition *condition;
+    struct flb_route_condition_rule *rule;
+    struct flb_log_event_encoder encoder;
+    struct flb_event_chunk chunk;
+    struct flb_router_chunk_context context;
+    int ret;
+
+    memset(&route, 0, sizeof(route));
+    cfl_list_init(&route.outputs);
+    cfl_list_init(&route.processors);
+
+    condition = flb_calloc(1, sizeof(struct flb_route_condition));
+    TEST_CHECK(condition != NULL);
+    if (!condition) {
+        return;
+    }
+
+    cfl_list_init(&condition->rules);
+    condition->op = FLB_COND_OP_AND;
+    condition->compiled_status = 0;
+    condition->compiled = NULL;
+    condition->is_default = FLB_FALSE;
+
+    rule = flb_calloc(1, sizeof(struct flb_route_condition_rule));
+    TEST_CHECK(rule != NULL);
+    if (!rule) {
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_init(&rule->_head);
+    rule->field = flb_sds_create("$source");
+    rule->op = flb_sds_create("eq");
+    rule->value = flb_sds_create("app");
+    rule->context = RECORD_CONTEXT_METADATA;
+    TEST_CHECK(rule->field != NULL && rule->op != NULL && rule->value != NULL);
+    if (!rule->field || !rule->op || !rule->value) {
+        if (rule->field) {
+            flb_sds_destroy(rule->field);
+        }
+        if (rule->op) {
+            flb_sds_destroy(rule->op);
+        }
+        if (rule->value) {
+            flb_sds_destroy(rule->value);
+        }
+        flb_free(rule);
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_add(&rule->_head, &condition->rules);
+
+    route.condition = condition;
+    route.signals = FLB_ROUTER_SIGNAL_LOGS;
+
+    flb_router_chunk_context_init(&context);
+
+    ret = build_log_chunk_with_metadata("source", "app", "level", "info",
+                                        &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_TRUE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    ret = build_log_chunk_with_metadata("source", "other", "level", "info",
+                                        &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_FALSE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    flb_router_chunk_context_destroy(&context);
+    free_route_condition(condition);
+}
+
+static void test_router_condition_eval_logs_group_context()
+{
+    struct flb_route route;
+    struct flb_route_condition *condition;
+    struct flb_route_condition_rule *rule;
+    struct flb_log_event_encoder encoder;
+    struct flb_event_chunk chunk;
+    struct flb_router_chunk_context context;
+    int ret;
+
+    memset(&route, 0, sizeof(route));
+    cfl_list_init(&route.outputs);
+    cfl_list_init(&route.processors);
+
+    condition = flb_calloc(1, sizeof(struct flb_route_condition));
+    TEST_CHECK(condition != NULL);
+    if (!condition) {
+        return;
+    }
+
+    cfl_list_init(&condition->rules);
+    condition->op = FLB_COND_OP_AND;
+    condition->compiled_status = 0;
+    condition->compiled = NULL;
+    condition->is_default = FLB_FALSE;
+
+    rule = flb_calloc(1, sizeof(struct flb_route_condition_rule));
+    TEST_CHECK(rule != NULL);
+    if (!rule) {
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_init(&rule->_head);
+    rule->field = flb_sds_create("$tenant");
+    rule->op = flb_sds_create("eq");
+    rule->value = flb_sds_create("acme");
+    rule->context = RECORD_CONTEXT_GROUP_METADATA;
+    TEST_CHECK(rule->field != NULL && rule->op != NULL && rule->value != NULL);
+    if (!rule->field || !rule->op || !rule->value) {
+        if (rule->field) {
+            flb_sds_destroy(rule->field);
+        }
+        if (rule->op) {
+            flb_sds_destroy(rule->op);
+        }
+        if (rule->value) {
+            flb_sds_destroy(rule->value);
+        }
+        flb_free(rule);
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_add(&rule->_head, &condition->rules);
+
+    route.condition = condition;
+    route.signals = FLB_ROUTER_SIGNAL_LOGS;
+
+    flb_router_chunk_context_init(&context);
+
+    ret = build_log_group_chunk("tenant", "acme", "service", "frontend",
+                                "message", "hello", &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_TRUE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    ret = build_log_group_chunk("tenant", "other", "service", "frontend",
+                                "message", "hello", &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_FALSE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    flb_router_chunk_context_destroy(&context);
+    free_route_condition(condition);
+
+    /* Group attributes context */
+    memset(&route, 0, sizeof(route));
+    cfl_list_init(&route.outputs);
+    cfl_list_init(&route.processors);
+
+    condition = flb_calloc(1, sizeof(struct flb_route_condition));
+    TEST_CHECK(condition != NULL);
+    if (!condition) {
+        return;
+    }
+
+    cfl_list_init(&condition->rules);
+    condition->op = FLB_COND_OP_AND;
+    condition->compiled_status = 0;
+    condition->compiled = NULL;
+    condition->is_default = FLB_FALSE;
+
+    rule = flb_calloc(1, sizeof(struct flb_route_condition_rule));
+    TEST_CHECK(rule != NULL);
+    if (!rule) {
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_init(&rule->_head);
+    rule->field = flb_sds_create("$service");
+    rule->op = flb_sds_create("eq");
+    rule->value = flb_sds_create("frontend");
+    rule->context = RECORD_CONTEXT_GROUP_ATTRIBUTES;
+    TEST_CHECK(rule->field != NULL && rule->op != NULL && rule->value != NULL);
+    if (!rule->field || !rule->op || !rule->value) {
+        if (rule->field) {
+            flb_sds_destroy(rule->field);
+        }
+        if (rule->op) {
+            flb_sds_destroy(rule->op);
+        }
+        if (rule->value) {
+            flb_sds_destroy(rule->value);
+        }
+        flb_free(rule);
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_add(&rule->_head, &condition->rules);
+
+    route.condition = condition;
+    route.signals = FLB_ROUTER_SIGNAL_LOGS;
+
+    flb_router_chunk_context_init(&context);
+
+    ret = build_log_group_chunk("tenant", "acme", "service", "frontend",
+                                "message", "hello", &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_TRUE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    ret = build_log_group_chunk("tenant", "acme", "service", "backend",
+                                "message", "hello", &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_FALSE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    flb_router_chunk_context_destroy(&context);
+    free_route_condition(condition);
+}
+
+static void test_router_condition_eval_logs_otel_contexts()
+{
+    struct flb_route route;
+    struct flb_route_condition *condition;
+    struct flb_route_condition_rule *rule;
+    struct flb_log_event_encoder encoder;
+    struct flb_event_chunk chunk;
+    struct flb_router_chunk_context context;
+    int ret;
+
+    flb_router_chunk_context_init(&context);
+
+    /* Resource attributes context */
+    memset(&route, 0, sizeof(route));
+    cfl_list_init(&route.outputs);
+    cfl_list_init(&route.processors);
+
+    condition = flb_calloc(1, sizeof(struct flb_route_condition));
+    TEST_CHECK(condition != NULL);
+    if (!condition) {
+        flb_router_chunk_context_destroy(&context);
+        return;
+    }
+
+    cfl_list_init(&condition->rules);
+    condition->op = FLB_COND_OP_AND;
+    condition->compiled_status = 0;
+    condition->compiled = NULL;
+    condition->is_default = FLB_FALSE;
+
+    rule = flb_calloc(1, sizeof(struct flb_route_condition_rule));
+    TEST_CHECK(rule != NULL);
+    if (!rule) {
+        free_route_condition(condition);
+        flb_router_chunk_context_destroy(&context);
+        return;
+    }
+
+    cfl_list_init(&rule->_head);
+    rule->field = flb_sds_create("$service['name']");
+    rule->op = flb_sds_create("eq");
+    rule->value = flb_sds_create("backend");
+    rule->context = RECORD_CONTEXT_OTEL_RESOURCE_ATTRIBUTES;
+    TEST_CHECK(rule->field != NULL && rule->op != NULL && rule->value != NULL);
+    if (!rule->field || !rule->op || !rule->value) {
+        if (rule->field) {
+            flb_sds_destroy(rule->field);
+        }
+        if (rule->op) {
+            flb_sds_destroy(rule->op);
+        }
+        if (rule->value) {
+            flb_sds_destroy(rule->value);
+        }
+        flb_free(rule);
+        free_route_condition(condition);
+        flb_router_chunk_context_destroy(&context);
+        return;
+    }
+
+    cfl_list_add(&rule->_head, &condition->rules);
+
+    route.condition = condition;
+    route.signals = FLB_ROUTER_SIGNAL_LOGS;
+
+    ret = build_log_chunk_with_otel("backend", "demo", "1.0.0",
+                                    "scope.attr", "enabled",
+                                    &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_TRUE);
+    }
+    flb_router_chunk_context_reset(&context);
+    msgpack_sbuffer_destroy(&encoder.buffer);
+    flb_log_event_encoder_destroy(&encoder);
+
+    ret = build_log_chunk_with_otel("api", "demo", "1.0.0",
+                                    "scope.attr", "enabled",
+                                    &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_FALSE);
+    }
+    flb_router_chunk_context_reset(&context);
+    msgpack_sbuffer_destroy(&encoder.buffer);
+    flb_log_event_encoder_destroy(&encoder);
+
+    free_route_condition(condition);
+
+    /* Scope metadata context */
+    memset(&route, 0, sizeof(route));
+    cfl_list_init(&route.outputs);
+    cfl_list_init(&route.processors);
+
+    condition = flb_calloc(1, sizeof(struct flb_route_condition));
+    TEST_CHECK(condition != NULL);
+    if (!condition) {
+        flb_router_chunk_context_destroy(&context);
+        return;
+    }
+
+    cfl_list_init(&condition->rules);
+    condition->op = FLB_COND_OP_AND;
+    condition->compiled_status = 0;
+    condition->compiled = NULL;
+    condition->is_default = FLB_FALSE;
+
+    rule = flb_calloc(1, sizeof(struct flb_route_condition_rule));
+    TEST_CHECK(rule != NULL);
+    if (!rule) {
+        free_route_condition(condition);
+        flb_router_chunk_context_destroy(&context);
+        return;
+    }
+
+    cfl_list_init(&rule->_head);
+    rule->field = flb_sds_create("$name");
+    rule->op = flb_sds_create("eq");
+    rule->value = flb_sds_create("demo");
+    rule->context = RECORD_CONTEXT_OTEL_SCOPE_METADATA;
+    TEST_CHECK(rule->field != NULL && rule->op != NULL && rule->value != NULL);
+    if (!rule->field || !rule->op || !rule->value) {
+        if (rule->field) {
+            flb_sds_destroy(rule->field);
+        }
+        if (rule->op) {
+            flb_sds_destroy(rule->op);
+        }
+        if (rule->value) {
+            flb_sds_destroy(rule->value);
+        }
+        flb_free(rule);
+        free_route_condition(condition);
+        flb_router_chunk_context_destroy(&context);
+        return;
+    }
+
+    cfl_list_add(&rule->_head, &condition->rules);
+
+    route.condition = condition;
+    route.signals = FLB_ROUTER_SIGNAL_LOGS;
+
+    ret = build_log_chunk_with_otel("backend", "demo", "1.0.0",
+                                    "scope.attr", "enabled",
+                                    &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_TRUE);
+    }
+    flb_router_chunk_context_reset(&context);
+    msgpack_sbuffer_destroy(&encoder.buffer);
+    flb_log_event_encoder_destroy(&encoder);
+
+    ret = build_log_chunk_with_otel("backend", "other", "1.0.0",
+                                    "scope.attr", "enabled",
+                                    &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_FALSE);
+    }
+    flb_router_chunk_context_reset(&context);
+    msgpack_sbuffer_destroy(&encoder.buffer);
+    flb_log_event_encoder_destroy(&encoder);
+
+    free_route_condition(condition);
+
+    /* Scope attributes context */
+    memset(&route, 0, sizeof(route));
+    cfl_list_init(&route.outputs);
+    cfl_list_init(&route.processors);
+
+    condition = flb_calloc(1, sizeof(struct flb_route_condition));
+    TEST_CHECK(condition != NULL);
+    if (!condition) {
+        flb_router_chunk_context_destroy(&context);
+        return;
+    }
+
+    cfl_list_init(&condition->rules);
+    condition->op = FLB_COND_OP_AND;
+    condition->compiled_status = 0;
+    condition->compiled = NULL;
+    condition->is_default = FLB_FALSE;
+
+    rule = flb_calloc(1, sizeof(struct flb_route_condition_rule));
+    TEST_CHECK(rule != NULL);
+    if (!rule) {
+        free_route_condition(condition);
+        flb_router_chunk_context_destroy(&context);
+        return;
+    }
+
+    cfl_list_init(&rule->_head);
+    rule->field = flb_sds_create("$scope['attr']");
+    rule->op = flb_sds_create("eq");
+    rule->value = flb_sds_create("enabled");
+    rule->context = RECORD_CONTEXT_OTEL_SCOPE_ATTRIBUTES;
+    TEST_CHECK(rule->field != NULL && rule->op != NULL && rule->value != NULL);
+    if (!rule->field || !rule->op || !rule->value) {
+        if (rule->field) {
+            flb_sds_destroy(rule->field);
+        }
+        if (rule->op) {
+            flb_sds_destroy(rule->op);
+        }
+        if (rule->value) {
+            flb_sds_destroy(rule->value);
+        }
+        flb_free(rule);
+        free_route_condition(condition);
+        flb_router_chunk_context_destroy(&context);
+        return;
+    }
+
+    cfl_list_add(&rule->_head, &condition->rules);
+
+    route.condition = condition;
+    route.signals = FLB_ROUTER_SIGNAL_LOGS;
+
+    ret = build_log_chunk_with_otel("backend", "demo", "1.0.0",
+                                    "scope.attr", "enabled",
+                                    &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_TRUE);
+    }
+    flb_router_chunk_context_reset(&context);
+    msgpack_sbuffer_destroy(&encoder.buffer);
+    flb_log_event_encoder_destroy(&encoder);
+
+    ret = build_log_chunk_with_otel("backend", "demo", "1.0.0",
+                                    "scope.attr", "disabled",
+                                    &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_FALSE);
+    }
+    flb_router_chunk_context_reset(&context);
+    msgpack_sbuffer_destroy(&encoder.buffer);
+    flb_log_event_encoder_destroy(&encoder);
+
+    free_route_condition(condition);
+    flb_router_chunk_context_destroy(&context);
+}
+
+static void test_router_condition_eval_logs_match()
+{
+    struct flb_route route;
+    struct flb_route_condition *condition;
+    struct flb_route_condition_rule *rule;
+    struct flb_log_event_encoder encoder;
+    struct flb_event_chunk chunk;
+    struct flb_router_chunk_context context;
+    int ret;
+
+    memset(&route, 0, sizeof(route));
+    cfl_list_init(&route.outputs);
+    cfl_list_init(&route.processors);
+
+    condition = flb_calloc(1, sizeof(struct flb_route_condition));
+    TEST_CHECK(condition != NULL);
+    if (!condition) {
+        return;
+    }
+
+    cfl_list_init(&condition->rules);
+    condition->op = FLB_COND_OP_AND;
+    condition->compiled_status = 0;
+    condition->compiled = NULL;
+    condition->is_default = FLB_FALSE;
+
+    rule = flb_calloc(1, sizeof(struct flb_route_condition_rule));
+    TEST_CHECK(rule != NULL);
+    if (!rule) {
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_init(&rule->_head);
+    rule->field = flb_sds_create("$level");
+    rule->op = flb_sds_create("eq");
+    rule->value = flb_sds_create("error");
+    TEST_CHECK(rule->field != NULL && rule->op != NULL && rule->value != NULL);
+    if (!rule->field || !rule->op || !rule->value) {
+        if (rule->field) {
+            flb_sds_destroy(rule->field);
+        }
+        if (rule->op) {
+            flb_sds_destroy(rule->op);
+        }
+        if (rule->value) {
+            flb_sds_destroy(rule->value);
+        }
+        flb_free(rule);
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_add(&rule->_head, &condition->rules);
+
+    route.condition = condition;
+    route.signals = FLB_ROUTER_SIGNAL_LOGS;
+
+    flb_router_chunk_context_init(&context);
+
+    ret = build_log_chunk("error", &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_TRUE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    ret = build_log_chunk("info", &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_FALSE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    flb_router_chunk_context_destroy(&context);
+    free_route_condition(condition);
+}
+
+static void test_router_condition_eval_logs_in_operator()
+{
+    struct flb_route route;
+    struct flb_route_condition *condition;
+    struct flb_route_condition_rule *rule;
+    struct flb_log_event_encoder encoder;
+    struct flb_event_chunk chunk;
+    struct flb_router_chunk_context context;
+    int ret;
+
+    memset(&route, 0, sizeof(route));
+    cfl_list_init(&route.outputs);
+    cfl_list_init(&route.processors);
+
+    condition = flb_calloc(1, sizeof(struct flb_route_condition));
+    TEST_CHECK(condition != NULL);
+    if (!condition) {
+        return;
+    }
+
+    cfl_list_init(&condition->rules);
+    condition->op = FLB_COND_OP_AND;
+    condition->compiled_status = 0;
+    condition->compiled = NULL;
+    condition->is_default = FLB_FALSE;
+
+    rule = flb_calloc(1, sizeof(struct flb_route_condition_rule));
+    TEST_CHECK(rule != NULL);
+    if (!rule) {
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_init(&rule->_head);
+    rule->field = flb_sds_create("$level");
+    rule->op = flb_sds_create("in");
+    TEST_CHECK(rule->field != NULL && rule->op != NULL);
+    if (!rule->field || !rule->op) {
+        if (rule->field) {
+            flb_sds_destroy(rule->field);
+        }
+        if (rule->op) {
+            flb_sds_destroy(rule->op);
+        }
+        flb_free(rule);
+        free_route_condition(condition);
+        return;
+    }
+
+    rule->values_count = 2;
+    rule->values = flb_calloc(rule->values_count, sizeof(flb_sds_t));
+    TEST_CHECK(rule->values != NULL);
+    if (!rule->values) {
+        free_route_condition(condition);
+        flb_sds_destroy(rule->field);
+        flb_sds_destroy(rule->op);
+        flb_free(rule);
+        return;
+    }
+
+    rule->values[0] = flb_sds_create("error");
+    rule->values[1] = flb_sds_create("fatal");
+    TEST_CHECK(rule->values[0] != NULL && rule->values[1] != NULL);
+    if (!rule->values[0] || !rule->values[1]) {
+        if (rule->values[0]) {
+            flb_sds_destroy(rule->values[0]);
+        }
+        if (rule->values[1]) {
+            flb_sds_destroy(rule->values[1]);
+        }
+        flb_free(rule->values);
+        flb_sds_destroy(rule->field);
+        flb_sds_destroy(rule->op);
+        flb_free(rule);
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_add(&rule->_head, &condition->rules);
+
+    route.condition = condition;
+    route.signals = FLB_ROUTER_SIGNAL_LOGS;
+
+    flb_router_chunk_context_init(&context);
+
+    ret = build_log_chunk("fatal", &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_TRUE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    ret = build_log_chunk("debug", &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_condition_eval_logs(&chunk, &context, &route) == FLB_FALSE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    flb_router_chunk_context_destroy(&context);
+    free_route_condition(condition);
+}
+
+static void test_router_path_should_route_condition()
+{
+    struct flb_router_path path;
+    struct flb_route route;
+    struct flb_route_condition *condition;
+    struct flb_route_condition_rule *rule;
+    struct flb_log_event_encoder encoder;
+    struct flb_event_chunk chunk;
+    struct flb_router_chunk_context context;
+    int ret;
+
+    memset(&route, 0, sizeof(route));
+    cfl_list_init(&route.outputs);
+    cfl_list_init(&route.processors);
+
+    condition = flb_calloc(1, sizeof(struct flb_route_condition));
+    TEST_CHECK(condition != NULL);
+    if (!condition) {
+        return;
+    }
+
+    cfl_list_init(&condition->rules);
+    condition->op = FLB_COND_OP_AND;
+    condition->compiled_status = 0;
+    condition->compiled = NULL;
+    condition->is_default = FLB_FALSE;
+
+    rule = flb_calloc(1, sizeof(struct flb_route_condition_rule));
+    TEST_CHECK(rule != NULL);
+    if (!rule) {
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_init(&rule->_head);
+    rule->field = flb_sds_create("$level");
+    rule->op = flb_sds_create("eq");
+    rule->value = flb_sds_create("error");
+    TEST_CHECK(rule->field != NULL && rule->op != NULL && rule->value != NULL);
+    if (!rule->field || !rule->op || !rule->value) {
+        if (rule->field) {
+            flb_sds_destroy(rule->field);
+        }
+        if (rule->op) {
+            flb_sds_destroy(rule->op);
+        }
+        if (rule->value) {
+            flb_sds_destroy(rule->value);
+        }
+        flb_free(rule);
+        free_route_condition(condition);
+        return;
+    }
+
+    cfl_list_add(&rule->_head, &condition->rules);
+
+    route.condition = condition;
+    route.signals = FLB_ROUTER_SIGNAL_LOGS;
+
+    memset(&path, 0, sizeof(path));
+    path.route = &route;
+
+    flb_router_chunk_context_init(&context);
+
+    ret = build_log_chunk("error", &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_router_path_should_route(&chunk, &context, &path) == FLB_TRUE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    ret = build_log_chunk("info", &encoder, &chunk);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        TEST_CHECK(flb_router_path_should_route(&chunk, &context, &path) == FLB_FALSE);
+    }
+    flb_router_chunk_context_reset(&context);
+    flb_log_event_encoder_destroy(&encoder);
+
+    flb_router_chunk_context_destroy(&context);
+    free_route_condition(condition);
+}
+
 TEST_LIST = {
     { "parse_basic", test_router_config_parse_basic },
     { "duplicate_route", test_router_config_duplicate_route },
     { "parse_basic_file", test_router_config_parse_file_basic },
     { "parse_multi_signal_file", test_router_config_parse_file_multi_signal },
     { "parse_metrics_file", test_router_config_parse_file_metrics },
+    { "parse_contexts_file", test_router_config_parse_file_contexts },
     { "apply_config_success", test_router_apply_config_success },
     { "apply_config_missing_output", test_router_apply_config_missing_output },
+    { "apply_config_uses_input_alias", test_router_apply_config_uses_input_alias },
+    { "apply_config_distinct_instances_without_alias", test_router_apply_config_distinct_instances_without_alias },
     { "route_default_precedence", test_router_route_default_precedence },
+    { "condition_eval_logs_metadata_context", test_router_condition_eval_logs_metadata_context },
+    { "condition_eval_logs_group_context", test_router_condition_eval_logs_group_context },
+    { "condition_eval_logs_otel_contexts", test_router_condition_eval_logs_otel_contexts },
+    { "condition_eval_logs_match", test_router_condition_eval_logs_match },
+    { "condition_eval_logs_in_operator", test_router_condition_eval_logs_in_operator },
+    { "path_should_route_condition", test_router_path_should_route_condition },
     { 0 }
 };
