@@ -617,14 +617,11 @@ static int cb_s3_init(struct flb_output_instance *ins,
     ctx->retry_time = 0;
     ctx->upload_queue_success = FLB_FALSE;
 
-    /* Export context */
-    flb_output_set_context(ins, ctx);
-
-    /* initialize config map */
-    ret = flb_output_config_map_set(ins, (void *) ctx);
-    if (ret == -1) {
-        return -1;
+    if(ctx->ins->retry_limit < 0) {
+        ctx->ins->retry_limit = MAX_UPLOAD_ERRORS;
     }
+
+    flb_plg_info(ctx->ins, "Maximum upload errors: %d", ctx->ins->retry_limit);
 
     /* the check against -1 is works here because size_t is unsigned
      * and (int) -1 == unsigned max value
@@ -1365,9 +1362,8 @@ static int put_all_chunks(struct flb_s3 *ctx)
 
             if (chunk->failures >= ctx->ins->retry_limit) {
                 flb_plg_warn(ctx->ins,
-                             "Chunk for tag %s failed to send %i times, "
-                             "will not retry",
-                             (char *) fsf->meta_buf, ctx->ins->retry_limit);
+                             "Chunk for tag %s failed to send %d/%d times, will not retry"
+                             (char *) fsf->meta_buf, chunk->failures, ctx->ins->retry_limit);
                 flb_fstore_file_inactive(ctx->fs, fsf);
                 continue;
             }
@@ -3301,9 +3297,8 @@ static void cb_s3_upload(struct flb_config *config, void *data)
                           (char *) fsf->meta_buf);
             if(chunk->failures >= ctx->ins->retry_limit){
                 flb_plg_warn(ctx->ins,
-                             "Chunk for tag %s failed to send %i times, "
-                             "will not retry",
-                             (char *) fsf->meta_buf, ctx->ins->retry_limit);
+                             "Chunk for tag %s failed to send %d/%d times, will not retry",
+                             (char *) fsf->meta_buf, chunk->failures, ctx->ins->retry_limit);
                 flb_fstore_file_inactive(ctx->fs, fsf);
                 continue;
             }
@@ -3829,8 +3824,8 @@ static void cb_s3_flush(struct flb_event_chunk *event_chunk,
 
     /* Discard upload_file if it has failed to upload retry_limit times */
     if (upload_file != NULL && upload_file->failures >= ctx->ins->retry_limit) {
-        flb_plg_warn(ctx->ins, "File with tag %s failed to send %d times, will not "
-                     "retry", event_chunk->tag, ctx->ins->retry_limit);
+        flb_plg_warn(ctx->ins, "File with tag %s failed to send %d/%d times, will not retry",
+                     event_chunk->tag, upload_file->failures, ctx->ins->retry_limit);
         s3_store_file_inactive(ctx, upload_file);
         upload_file = NULL;
     }

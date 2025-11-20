@@ -48,6 +48,8 @@
 
 #define DEFAULT_UPLOAD_TIMEOUT 3600
 
+#define MAX_UPLOAD_ERRORS 5
+
 /*
  * If we see repeated errors on an upload/chunk, we will discard it
  * This saves us from scenarios where something goes wrong and an upload can
