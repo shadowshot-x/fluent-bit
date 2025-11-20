@@ -621,7 +621,14 @@ static int cb_s3_init(struct flb_output_instance *ins,
         ctx->ins->retry_limit = MAX_UPLOAD_ERRORS;
     }
 
-    flb_plg_info(ctx->ins, "Maximum upload errors: %d", ctx->ins->retry_limit);
+    /* Export context */
+    flb_output_set_context(ins, ctx);
+
+    /* initialize config map */
+    ret = flb_output_config_map_set(ins, (void *) ctx);
+    if (ret == -1) {
+        return -1;
+    }
 
     /* the check against -1 is works here because size_t is unsigned
      * and (int) -1 == unsigned max value
@@ -1366,7 +1373,7 @@ static int put_all_chunks(struct flb_s3 *ctx)
 
             if (chunk->failures >= ctx->ins->retry_limit) {
                 flb_plg_warn(ctx->ins,
-                             "Chunk for tag %s failed to send %d/%d times, will not retry"
+                             "Chunk for tag %s failed to send %d/%d times, will not retry",
                              (char *) fsf->meta_buf, chunk->failures, ctx->ins->retry_limit);
                 flb_fstore_file_inactive(ctx->fs, fsf);
                 continue;
